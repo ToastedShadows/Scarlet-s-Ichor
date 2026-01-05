@@ -36,12 +36,13 @@ public class PlayerMovement : MonoBehaviour
 
     [Header("Wall Check")]
     [SerializeField] private Transform wallCheck;
+    [SerializeField] private Vector2 wallCheckOffset = new Vector2(0.35f, 0.0f); // flips sides with facing
     [SerializeField] private float wallCheckRadius = 0.14f;
     [SerializeField] private LayerMask wallLayer;
 
     [Header("Wall Slide")]
-    [SerializeField] private float wallSlideMaxFallSpeed = -4f;        // clamp to this while sliding (negative)
-    [SerializeField] private float wallSlideGravityMultiplier = 0.5f;  // lower gravity while sliding
+    [SerializeField] private float wallSlideMaxFallSpeed = -4f;
+    [SerializeField] private float wallSlideGravityMultiplier = 0.5f;
     [SerializeField] private bool requireHoldingTowardWallToSlide = true;
 
     [Header("Wall Jump")]
@@ -97,7 +98,7 @@ public class PlayerMovement : MonoBehaviour
     private float jumpBufferLeft = 0f;
     private float coyoteTimeLeft = 0f;
 
-    // Wall
+    // Wall state
     private bool isTouchingWall;
     private bool isWallSliding;
     private float wallJumpDirX; // -1 jump left, +1 jump right
@@ -125,7 +126,7 @@ public class PlayerMovement : MonoBehaviour
 
         downHeld = Keyboard.current.downArrowKey.isPressed;
 
-        // Buffer jump input
+        // Jump buffer
         if (Keyboard.current.zKey.wasPressedThisFrame)
             jumpBufferLeft = jumpBufferTime;
 
@@ -146,10 +147,19 @@ public class PlayerMovement : MonoBehaviour
             coyoteTimeLeft -= Time.deltaTime;
         }
 
-        // Wall detect
+        // Flip sprite (don’t fight wall-jump lock)
+        if (wallJumpLockLeft <= 0f)
+        {
+            if (horizontal > EPS) sr.flipX = false;
+            else if (horizontal < -EPS) sr.flipX = true;
+        }
+
+        // Keep wallCheck on the facing side
+        UpdateWallCheckPosition();
+
+        // Wall detect + slide state
         ResolveWallContact();
 
-        // Wall slide state (real physics override happens in FixedUpdate)
         bool holdingTowardWall = Mathf.Abs(horizontal) > EPS && Mathf.Sign(horizontal) == Mathf.Sign(-wallJumpDirX);
         isWallSliding =
             !isGrounded &&
@@ -157,13 +167,6 @@ public class PlayerMovement : MonoBehaviour
             isTouchingWall &&
             rb.linearVelocity.y <= 0f &&
             (!requireHoldingTowardWallToSlide || holdingTowardWall);
-
-        // Flip sprite (don’t fight wall-jump lock)
-        if (wallJumpLockLeft <= 0f)
-        {
-            if (horizontal > EPS) sr.flipX = false;
-            else if (horizontal < -EPS) sr.flipX = true;
-        }
 
         // Dash start
         if (Keyboard.current.cKey.wasPressedThisFrame && !isDashing && dashCooldownLeft <= 0f)
@@ -182,7 +185,10 @@ public class PlayerMovement : MonoBehaviour
         // Variable jump cut
         if (Keyboard.current.zKey.wasReleasedThisFrame && rb.linearVelocity.y > 0f)
         {
-            rb.linearVelocity = new Vector2(rb.linearVelocity.x, rb.linearVelocity.y * jumpCutMultiplier);
+            rb.linearVelocity = new Vector2(
+                rb.linearVelocity.x,
+                rb.linearVelocity.y * jumpCutMultiplier
+            );
         }
 
         UpdateAnimationState();
@@ -211,7 +217,7 @@ public class PlayerMovement : MonoBehaviour
         float newX = Mathf.MoveTowards(rb.linearVelocity.x, targetX, rate * Time.fixedDeltaTime);
         rb.linearVelocity = new Vector2(newX, rb.linearVelocity.y);
 
-        // ✅ WALL SLIDE MUST OVERRIDE GRAVITY + FALL SPEED
+        // Wall slide override (must win over better jump physics)
         if (isWallSliding)
         {
             rb.gravityScale = baseGravity * wallSlideGravityMultiplier;
@@ -219,10 +225,18 @@ public class PlayerMovement : MonoBehaviour
             if (rb.linearVelocity.y < wallSlideMaxFallSpeed)
                 rb.linearVelocity = new Vector2(rb.linearVelocity.x, wallSlideMaxFallSpeed);
 
-            return; // <- IMPORTANT: don't let ApplyBetterJumpPhysics overwrite gravityScale
+            return;
         }
 
         ApplyBetterJumpPhysics();
+    }
+
+    private void UpdateWallCheckPosition()
+    {
+        if (wallCheck == null) return;
+
+        float side = sr.flipX ? -1f : 1f; // facing left if flipped
+        wallCheck.position = (Vector2)transform.position + new Vector2(wallCheckOffset.x * side, wallCheckOffset.y);
     }
 
     private void ResolveWallContact()
@@ -233,8 +247,8 @@ public class PlayerMovement : MonoBehaviour
         if (isGrounded || isDashing || wallCheck == null) return;
 
         Collider2D[] hits = Physics2D.OverlapCircleAll(wallCheck.position, wallCheckRadius, wallLayer);
-        Collider2D best = null;
 
+        Collider2D best = null;
         for (int i = 0; i < hits.Length; i++)
         {
             Collider2D h = hits[i];
@@ -249,7 +263,6 @@ public class PlayerMovement : MonoBehaviour
         if (best != null)
         {
             isTouchingWall = true;
-            // wall to the right -> jump left (-1), wall to the left -> jump right (+1)
             wallJumpDirX = (best.bounds.center.x > transform.position.x) ? -1f : 1f;
         }
     }
@@ -259,27 +272,27 @@ public class PlayerMovement : MonoBehaviour
         if (jumpBufferLeft <= 0f) return;
         if (isDashing) return;
 
-        // 1) WALL JUMP: allowed even if you used all double jumps
+        // WALL JUMP (allowed even if you used all double jumps)
         if (!isGrounded && isTouchingWall && wallJumpDirX != 0f)
         {
             rb.linearVelocity = new Vector2(wallJumpDirX * wallJumpHorizontalForce, wallJumpForce);
 
-            // Face in jump direction
+            // Face jump direction
             sr.flipX = wallJumpDirX < 0f;
 
             wallJumpLockLeft = wallJumpLockTime;
 
-            // ✅ Refill air jumps after wall jump (so wall jump is always useful)
+            // Refill air jumps after wall jump
             jumpsRemaining = Mathf.Clamp(refillJumpsAfterWallJump, 0, maxJumps);
 
-            // Consume buffer and stop coyote to avoid double-trigger
+            // Consume buffer + stop coyote
             jumpBufferLeft = 0f;
             coyoteTimeLeft = 0f;
 
             return;
         }
 
-        // 2) NORMAL JUMP (ground/coyote/air)
+        // NORMAL JUMP (ground/coyote/air)
         bool canUseCoyote = (coyoteTimeLeft > 0f) && (jumpsRemaining == maxJumps);
 
         if (jumpsRemaining > 0 || canUseCoyote)
@@ -306,7 +319,8 @@ public class PlayerMovement : MonoBehaviour
 
         rb.linearVelocity = new Vector2(newX, newY);
 
-        rb.gravityScale = baseGravity * (isDownDash ? downDashGravityMultiplier : dashGravityMultiplier);
+        rb.gravityScale = baseGravity *
+            (isDownDash ? downDashGravityMultiplier : dashGravityMultiplier);
 
         if (dashTimeLeft <= 0f)
             EndDash();
