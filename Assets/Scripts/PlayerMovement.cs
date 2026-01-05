@@ -8,7 +8,7 @@ public class PlayerMovement : MonoBehaviour
     private Animator anim;
     private Collider2D selfCol;
 
-    private enum MovementState { idle, running, jumping, falling, dashing }
+    private enum MovementState { idle, running, jumping, falling, rolling }
     private MovementState state;
 
     [Header("Movement")]
@@ -20,7 +20,7 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private float jumpForce = 12f;
     [SerializeField] private int maxJumps = 2;
 
-    [Header("Jump Buffer (Grace Timer)")]
+    [Header("Jump Buffer")]
     [SerializeField] private float jumpBufferTime = 0.12f;
 
     [Header("Coyote Time")]
@@ -36,38 +36,27 @@ public class PlayerMovement : MonoBehaviour
 
     [Header("Wall Check")]
     [SerializeField] private Transform wallCheck;
-    [SerializeField] private Vector2 wallCheckOffset = new Vector2(0.35f, 0.0f); // flips sides with facing
+    [SerializeField] private Vector2 wallCheckOffset = new Vector2(0.35f, 0f);
     [SerializeField] private float wallCheckRadius = 0.14f;
     [SerializeField] private LayerMask wallLayer;
 
     [Header("Wall Slide")]
     [SerializeField] private float wallSlideMaxFallSpeed = -4f;
     [SerializeField] private float wallSlideGravityMultiplier = 0.5f;
-    [SerializeField] private bool requireHoldingTowardWallToSlide = true;
 
     [Header("Wall Jump")]
     [SerializeField] private float wallJumpForce = 12f;
     [SerializeField] private float wallJumpHorizontalForce = 8f;
     [SerializeField] private float wallJumpLockTime = 0.15f;
-    [SerializeField] private int refillJumpsAfterWallJump = 1; // set to maxJumps to fully refill
+    [SerializeField] private int refillJumpsAfterWallJump = 1;
 
-    [Header("Dash")]
-    [SerializeField] private float dashSpeed = 15f;
-    [SerializeField] private float dashDuration = 0.15f;
-    [SerializeField] private float dashCooldown = 0.5f;
-    [SerializeField] private bool refreshDashOnGround = true;
-    [SerializeField] private bool cancelDashOnWallHit = true;
-
-    [Header("Dash Cancel")]
-    [SerializeField] private bool cancelDashOnTurn = true;
-
-    [Header("Down Dash")]
-    [SerializeField] private float downDashAngle = 45f;
-    [SerializeField] private float downDashMultiplier = 1.5f;
-
-    [Header("Dash Gravity")]
-    [SerializeField] private float dashGravityMultiplier = 2f;
-    [SerializeField] private float downDashGravityMultiplier = 3.5f;
+    [Header("Roll (Dash Replacement)")]
+    [SerializeField] private float rollBoost = 8f;        // one-time horizontal boost
+    [SerializeField] private float rollDuration = 0.18f;  // roll "state" time (animation / input lock)
+    [SerializeField] private float rollCooldown = 0.5f;
+    [SerializeField] private float rollControlMultiplier = 0.35f; // how much A/D works during roll (0 = locked, 1 = normal)
+    [SerializeField] private float rollExtraDecel = 20f;  // extra X decel during roll (helps it feel like a roll)
+    [SerializeField] private bool cancelRollOnTurn = false;
 
     [Header("Jump Feel")]
     [SerializeField] private float apexVelocityThreshold = 1.5f;
@@ -75,36 +64,31 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private float fallGravityMultiplier = 2.5f;
     [SerializeField] private float maxFallSpeed = -18f;
 
-    [Header("Animation")]
-    [SerializeField] private float dashAnimationLength = 0.5f;
-
     private int jumpsRemaining;
     private bool isGrounded;
 
     private float horizontal;
-    private bool downHeld;
-
-    private bool isDashing;
-    private bool isDownDash;
-    private float dashTimeLeft;
-    private float dashCooldownLeft;
-    private Vector2 dashVelocity;
-    private float dashDirSign;
 
     private float baseGravity;
     private const float EPS = 0.01f;
 
     // Jump buffer + coyote
-    private float jumpBufferLeft = 0f;
-    private float coyoteTimeLeft = 0f;
+    private float jumpBufferLeft;
+    private float coyoteTimeLeft;
 
-    // Wall state
+    // Wall
     private bool isTouchingWall;
     private bool isWallSliding;
-    private float wallJumpDirX; // -1 jump left, +1 jump right
+    private float wallJumpDirX;
 
     // Wall jump lock
-    private float wallJumpLockLeft = 0f;
+    private float wallJumpLockLeft;
+
+    // Roll
+    private bool isRolling;
+    private float rollTimeLeft;
+    private float rollCooldownLeft;
+    private float rollDirSign;
 
     void Awake()
     {
@@ -119,15 +103,13 @@ public class PlayerMovement : MonoBehaviour
 
     void Update()
     {
-        // Input
+        // ===== INPUT =====
         horizontal =
-            (Keyboard.current.rightArrowKey.isPressed ? 1f : 0f) +
-            (Keyboard.current.leftArrowKey.isPressed ? -1f : 0f);
+            (Keyboard.current.dKey.isPressed ? 1f : 0f) +
+            (Keyboard.current.aKey.isPressed ? -1f : 0f);
 
-        downHeld = Keyboard.current.downArrowKey.isPressed;
-
-        // Jump buffer
-        if (Keyboard.current.zKey.wasPressedThisFrame)
+        // Jump buffer (W)
+        if (Keyboard.current.wKey.wasPressedThisFrame)
             jumpBufferLeft = jumpBufferTime;
 
         if (jumpBufferLeft > 0f)
@@ -135,12 +117,10 @@ public class PlayerMovement : MonoBehaviour
 
         // Ground check + coyote
         isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
-
         if (isGrounded)
         {
             jumpsRemaining = maxJumps;
             coyoteTimeLeft = coyoteTime;
-            if (refreshDashOnGround) dashCooldownLeft = 0f;
         }
         else
         {
@@ -154,41 +134,37 @@ public class PlayerMovement : MonoBehaviour
             else if (horizontal < -EPS) sr.flipX = true;
         }
 
-        // Keep wallCheck on the facing side
+        // Wall check moves with facing
         UpdateWallCheckPosition();
-
-        // Wall detect + slide state
         ResolveWallContact();
 
-        bool holdingTowardWall = Mathf.Abs(horizontal) > EPS && Mathf.Sign(horizontal) == Mathf.Sign(-wallJumpDirX);
+        // Wall slide (disabled while rolling)
         isWallSliding =
             !isGrounded &&
-            !isDashing &&
+            !isRolling &&
             isTouchingWall &&
-            rb.linearVelocity.y <= 0f &&
-            (!requireHoldingTowardWallToSlide || holdingTowardWall);
+            rb.linearVelocity.y < 0f;
 
-        // Dash start
-        if (Keyboard.current.cKey.wasPressedThisFrame && !isDashing && dashCooldownLeft <= 0f)
-            StartDash(downHeld);
-
-        // Cancel dash if player turns around
-        if (isDashing && cancelDashOnTurn && Mathf.Abs(horizontal) > EPS)
+        // Roll start (S)
+        if (Keyboard.current.sKey.wasPressedThisFrame && !isRolling && rollCooldownLeft <= 0f)
         {
-            if (Mathf.Sign(horizontal) != dashDirSign)
-                EndDash();
+            StartRoll();
         }
 
-        // Consume buffered jump (wall jump priority)
+        // Optional: cancel roll if opposite direction pressed
+        if (isRolling && cancelRollOnTurn && Mathf.Abs(horizontal) > EPS)
+        {
+            if (Mathf.Sign(horizontal) != rollDirSign)
+                EndRoll();
+        }
+
+        // Jump consume (wall jump priority)
         TryConsumeBufferedJump();
 
-        // Variable jump cut
-        if (Keyboard.current.zKey.wasReleasedThisFrame && rb.linearVelocity.y > 0f)
+        // Variable jump cut (W release)
+        if (Keyboard.current.wKey.wasReleasedThisFrame && rb.linearVelocity.y > 0f)
         {
-            rb.linearVelocity = new Vector2(
-                rb.linearVelocity.x,
-                rb.linearVelocity.y * jumpCutMultiplier
-            );
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, rb.linearVelocity.y * jumpCutMultiplier);
         }
 
         UpdateAnimationState();
@@ -196,28 +172,34 @@ public class PlayerMovement : MonoBehaviour
 
     void FixedUpdate()
     {
-        if (dashCooldownLeft > 0f)
-            dashCooldownLeft -= Time.fixedDeltaTime;
+        if (rollCooldownLeft > 0f)
+            rollCooldownLeft -= Time.fixedDeltaTime;
 
         if (wallJumpLockLeft > 0f)
             wallJumpLockLeft -= Time.fixedDeltaTime;
 
-        if (isDashing)
+        if (isRolling)
         {
-            DashTick();
-            return;
+            rollTimeLeft -= Time.fixedDeltaTime;
+            if (rollTimeLeft <= 0f)
+                EndRoll();
         }
 
-        // Horizontal ramping (ignore input briefly after wall jump)
-        float inputX = (wallJumpLockLeft > 0f) ? 0f : horizontal;
+        // Horizontal movement (reduced control during roll)
+        float control = isRolling ? rollControlMultiplier : 1f;
+        float inputX = wallJumpLockLeft > 0f ? 0f : (horizontal * control);
 
         float targetX = inputX * moveSpeed;
         float rate = Mathf.Abs(targetX) > EPS ? acceleration : deceleration;
 
+        // Extra decel during roll so it doesn't feel like a dash
+        if (isRolling && Mathf.Abs(targetX) < EPS)
+            rate += rollExtraDecel;
+
         float newX = Mathf.MoveTowards(rb.linearVelocity.x, targetX, rate * Time.fixedDeltaTime);
         rb.linearVelocity = new Vector2(newX, rb.linearVelocity.y);
 
-        // Wall slide override (must win over better jump physics)
+        // Wall slide override
         if (isWallSliding)
         {
             rb.gravityScale = baseGravity * wallSlideGravityMultiplier;
@@ -228,14 +210,68 @@ public class PlayerMovement : MonoBehaviour
             return;
         }
 
-        ApplyBetterJumpPhysics();
+        ApplyBetterJumpPhysics(); // ✅ gravity stays normal during roll (no glide)
     }
 
+    // ===== ROLL =====
+    private void StartRoll()
+    {
+        // Determine direction: input if held, otherwise facing
+        float dir = (Mathf.Abs(horizontal) > EPS) ? Mathf.Sign(horizontal) : (sr.flipX ? -1f : 1f);
+        rollDirSign = Mathf.Sign(dir);
+
+        isRolling = true;
+        rollTimeLeft = rollDuration;
+        rollCooldownLeft = rollCooldown;
+
+        // ✅ ONE-TIME BOOST ONLY (does NOT overwrite Y, does NOT keep forcing X)
+        rb.linearVelocity = new Vector2(rb.linearVelocity.x + rollDirSign * rollBoost, rb.linearVelocity.y);
+    }
+
+    private void EndRoll()
+    {
+        isRolling = false;
+    }
+
+    // ===== JUMP LOGIC =====
+    private void TryConsumeBufferedJump()
+    {
+        if (jumpBufferLeft <= 0f) return;
+
+        // (Optional) allow jumping during roll; if you want roll to block jumps, add: if (isRolling) return;
+
+        // Wall jump (allowed even if you used all double jumps)
+        if (!isGrounded && isTouchingWall)
+        {
+            rb.linearVelocity = new Vector2(wallJumpDirX * wallJumpHorizontalForce, wallJumpForce);
+
+            sr.flipX = wallJumpDirX < 0f;
+            wallJumpLockLeft = wallJumpLockTime;
+            jumpsRemaining = Mathf.Clamp(refillJumpsAfterWallJump, 0, maxJumps);
+
+            jumpBufferLeft = 0f;
+            coyoteTimeLeft = 0f;
+            return;
+        }
+
+        // Normal jump (ground/coyote/air)
+        bool canCoyote = coyoteTimeLeft > 0f && jumpsRemaining == maxJumps;
+
+        if (jumpsRemaining > 0 || canCoyote)
+        {
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, jumpForce);
+            if (!canCoyote) jumpsRemaining--;
+
+            jumpBufferLeft = 0f;
+            coyoteTimeLeft = 0f;
+        }
+    }
+
+    // ===== WALL CHECK =====
     private void UpdateWallCheckPosition()
     {
-        if (wallCheck == null) return;
-
-        float side = sr.flipX ? -1f : 1f; // facing left if flipped
+        if (!wallCheck) return;
+        float side = sr.flipX ? -1f : 1f;
         wallCheck.position = (Vector2)transform.position + new Vector2(wallCheckOffset.x * side, wallCheckOffset.y);
     }
 
@@ -244,129 +280,21 @@ public class PlayerMovement : MonoBehaviour
         isTouchingWall = false;
         wallJumpDirX = 0f;
 
-        if (isGrounded || isDashing || wallCheck == null) return;
+        if (!wallCheck) return;
 
         Collider2D[] hits = Physics2D.OverlapCircleAll(wallCheck.position, wallCheckRadius, wallLayer);
-
-        Collider2D best = null;
-        for (int i = 0; i < hits.Length; i++)
+        foreach (Collider2D h in hits)
         {
-            Collider2D h = hits[i];
             if (h == null) continue;
             if (h == selfCol) continue;
-            if (h.attachedRigidbody != null && h.attachedRigidbody == rb) continue;
 
-            best = h;
+            isTouchingWall = true;
+            wallJumpDirX = (h.bounds.center.x > transform.position.x) ? -1f : 1f;
             break;
         }
-
-        if (best != null)
-        {
-            isTouchingWall = true;
-            wallJumpDirX = (best.bounds.center.x > transform.position.x) ? -1f : 1f;
-        }
     }
 
-    private void TryConsumeBufferedJump()
-    {
-        if (jumpBufferLeft <= 0f) return;
-        if (isDashing) return;
-
-        // WALL JUMP (allowed even if you used all double jumps)
-        if (!isGrounded && isTouchingWall && wallJumpDirX != 0f)
-        {
-            rb.linearVelocity = new Vector2(wallJumpDirX * wallJumpHorizontalForce, wallJumpForce);
-
-            // Face jump direction
-            sr.flipX = wallJumpDirX < 0f;
-
-            wallJumpLockLeft = wallJumpLockTime;
-
-            // Refill air jumps after wall jump
-            jumpsRemaining = Mathf.Clamp(refillJumpsAfterWallJump, 0, maxJumps);
-
-            // Consume buffer + stop coyote
-            jumpBufferLeft = 0f;
-            coyoteTimeLeft = 0f;
-
-            return;
-        }
-
-        // NORMAL JUMP (ground/coyote/air)
-        bool canUseCoyote = (coyoteTimeLeft > 0f) && (jumpsRemaining == maxJumps);
-
-        if (jumpsRemaining > 0 || canUseCoyote)
-        {
-            rb.linearVelocity = new Vector2(rb.linearVelocity.x, jumpForce);
-
-            if (!canUseCoyote)
-                jumpsRemaining--;
-
-            jumpBufferLeft = 0f;
-            coyoteTimeLeft = 0f;
-        }
-    }
-
-    private void DashTick()
-    {
-        dashTimeLeft -= Time.fixedDeltaTime;
-
-        float newX = dashVelocity.x;
-        float newY = rb.linearVelocity.y;
-
-        if (isDownDash)
-            newY += dashVelocity.y * Time.fixedDeltaTime;
-
-        rb.linearVelocity = new Vector2(newX, newY);
-
-        rb.gravityScale = baseGravity *
-            (isDownDash ? downDashGravityMultiplier : dashGravityMultiplier);
-
-        if (dashTimeLeft <= 0f)
-            EndDash();
-    }
-
-    private void StartDash(bool downward)
-    {
-        float facingDir =
-            Mathf.Abs(horizontal) > EPS ? Mathf.Sign(horizontal) :
-            (sr.flipX ? -1f : 1f);
-
-        dashDirSign = Mathf.Sign(facingDir);
-        isDownDash = downward;
-
-        if (downward)
-        {
-            float rad = downDashAngle * Mathf.Deg2Rad;
-            Vector2 dir = new Vector2(Mathf.Cos(rad) * facingDir, -Mathf.Sin(rad)).normalized;
-            dashVelocity = new Vector2(dir.x * dashSpeed, dir.y * dashSpeed * downDashMultiplier);
-        }
-        else
-        {
-            dashVelocity = new Vector2(facingDir * dashSpeed, 0f);
-        }
-
-        isDashing = true;
-        dashTimeLeft = dashDuration;
-
-        anim.speed = dashAnimationLength / Mathf.Max(dashDuration, 0.0001f);
-    }
-
-    private void EndDash()
-    {
-        isDashing = false;
-        isDownDash = false;
-        dashCooldownLeft = dashCooldown;
-
-        rb.gravityScale = baseGravity;
-        anim.speed = 1f;
-
-        rb.linearVelocity = new Vector2(
-            Mathf.Clamp(rb.linearVelocity.x, -moveSpeed, moveSpeed),
-            rb.linearVelocity.y
-        );
-    }
-
+    // ===== GRAVITY / JUMP FEEL =====
     private void ApplyBetterJumpPhysics()
     {
         if (rb.linearVelocity.y < 0f)
@@ -388,36 +316,22 @@ public class PlayerMovement : MonoBehaviour
 
     private void UpdateAnimationState()
     {
-        if (isDashing) state = MovementState.dashing;
+        if (isRolling) state = MovementState.rolling;
         else if (rb.linearVelocity.y > 0.1f) state = MovementState.jumping;
         else if (rb.linearVelocity.y < -0.1f) state = MovementState.falling;
         else if (Mathf.Abs(horizontal) > EPS) state = MovementState.running;
         else state = MovementState.idle;
 
-        anim.SetInteger("State", (int)state);
-    }
-
-    private void OnCollisionEnter2D(Collision2D collision)
-    {
-        if (!isDashing || !cancelDashOnWallHit) return;
-
-        for (int i = 0; i < collision.contactCount; i++)
-        {
-            Vector2 n = collision.GetContact(i).normal;
-            if (Mathf.Abs(n.x) > 0.5f)
-            {
-                EndDash();
-                break;
-            }
-        }
+        if (anim != null)
+            anim.SetInteger("State", (int)state);
     }
 
     private void OnDrawGizmosSelected()
     {
-        if (groundCheck != null)
+        if (groundCheck)
             Gizmos.DrawWireSphere(groundCheck.position, groundCheckRadius);
 
-        if (wallCheck != null)
+        if (wallCheck)
             Gizmos.DrawWireSphere(wallCheck.position, wallCheckRadius);
     }
 }

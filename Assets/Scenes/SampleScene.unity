@@ -8210,26 +8210,20 @@ MonoBehaviour:
     m_Bits: 128
   wallSlideMaxFallSpeed: -4
   wallSlideGravityMultiplier: 0.5
-  requireHoldingTowardWallToSlide: 1
   wallJumpForce: 18
   wallJumpHorizontalForce: 15
   wallJumpLockTime: 0
   refillJumpsAfterWallJump: 0
-  dashSpeed: 20
-  dashDuration: 0.2
-  dashCooldown: 0.5
-  refreshDashOnGround: 1
-  cancelDashOnWallHit: 1
-  cancelDashOnTurn: 1
-  downDashAngle: 45
-  downDashMultiplier: 2
-  dashGravityMultiplier: 2
-  downDashGravityMultiplier: 5
+  rollBoost: 10
+  rollDuration: 0.2
+  rollCooldown: 0.5
+  rollControlMultiplier: 1.5
+  rollExtraDecel: 100
+  cancelRollOnTurn: 1
   apexVelocityThreshold: 1.5
   apexGravityMultiplier: 0.5
   fallGravityMultiplier: 2.5
   maxFallSpeed: -18
-  dashAnimationLength: 0.5
 --- !u!95 &1728524116
 Animator:
   serializedVersion: 7
