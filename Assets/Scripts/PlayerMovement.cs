@@ -6,6 +6,7 @@ public class PlayerMovement : MonoBehaviour
     private Rigidbody2D rb;
     private SpriteRenderer sr;
     private Animator anim;
+    private Collider2D selfCol;
 
     private enum MovementState { idle, running, jumping, falling, dashing }
     private MovementState state;
@@ -19,6 +20,12 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private float jumpForce = 12f;
     [SerializeField] private int maxJumps = 2;
 
+    [Header("Jump Buffer (Grace Timer)")]
+    [SerializeField] private float jumpBufferTime = 0.12f;
+
+    [Header("Coyote Time")]
+    [SerializeField] private float coyoteTime = 0.1f;
+
     [Header("Variable Jump")]
     [SerializeField] private float jumpCutMultiplier = 0.5f;
 
@@ -26,6 +33,22 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private Transform groundCheck;
     [SerializeField] private float groundCheckRadius = 0.12f;
     [SerializeField] private LayerMask groundLayer;
+
+    [Header("Wall Check")]
+    [SerializeField] private Transform wallCheck;
+    [SerializeField] private float wallCheckRadius = 0.14f;
+    [SerializeField] private LayerMask wallLayer;
+
+    [Header("Wall Slide")]
+    [SerializeField] private float wallSlideMaxFallSpeed = -4f;        // clamp to this while sliding (negative)
+    [SerializeField] private float wallSlideGravityMultiplier = 0.5f;  // lower gravity while sliding
+    [SerializeField] private bool requireHoldingTowardWallToSlide = true;
+
+    [Header("Wall Jump")]
+    [SerializeField] private float wallJumpForce = 12f;
+    [SerializeField] private float wallJumpHorizontalForce = 8f;
+    [SerializeField] private float wallJumpLockTime = 0.15f;
+    [SerializeField] private int refillJumpsAfterWallJump = 1; // set to maxJumps to fully refill
 
     [Header("Dash")]
     [SerializeField] private float dashSpeed = 15f;
@@ -70,11 +93,24 @@ public class PlayerMovement : MonoBehaviour
     private float baseGravity;
     private const float EPS = 0.01f;
 
+    // Jump buffer + coyote
+    private float jumpBufferLeft = 0f;
+    private float coyoteTimeLeft = 0f;
+
+    // Wall
+    private bool isTouchingWall;
+    private bool isWallSliding;
+    private float wallJumpDirX; // -1 jump left, +1 jump right
+
+    // Wall jump lock
+    private float wallJumpLockLeft = 0f;
+
     void Awake()
     {
         rb = GetComponent<Rigidbody2D>();
         sr = GetComponent<SpriteRenderer>();
         anim = GetComponent<Animator>();
+        selfCol = GetComponent<Collider2D>();
 
         baseGravity = rb.gravityScale;
         jumpsRemaining = maxJumps;
@@ -89,47 +125,64 @@ public class PlayerMovement : MonoBehaviour
 
         downHeld = Keyboard.current.downArrowKey.isPressed;
 
-        // Ground check
+        // Buffer jump input
+        if (Keyboard.current.zKey.wasPressedThisFrame)
+            jumpBufferLeft = jumpBufferTime;
+
+        if (jumpBufferLeft > 0f)
+            jumpBufferLeft -= Time.deltaTime;
+
+        // Ground check + coyote
         isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+
         if (isGrounded)
         {
             jumpsRemaining = maxJumps;
+            coyoteTimeLeft = coyoteTime;
             if (refreshDashOnGround) dashCooldownLeft = 0f;
         }
-
-        // Flip sprite
-        if (horizontal > EPS) sr.flipX = false;
-        else if (horizontal < -EPS) sr.flipX = true;
-
-        // Jump press
-        if (Keyboard.current.zKey.wasPressedThisFrame && jumpsRemaining > 0)
+        else
         {
-            rb.linearVelocity = new Vector2(rb.linearVelocity.x, jumpForce);
-            jumpsRemaining--;
+            coyoteTimeLeft -= Time.deltaTime;
         }
 
-        // Variable jump cut
-        if (Keyboard.current.zKey.wasReleasedThisFrame && rb.linearVelocity.y > 0f)
+        // Wall detect
+        ResolveWallContact();
+
+        // Wall slide state (real physics override happens in FixedUpdate)
+        bool holdingTowardWall = Mathf.Abs(horizontal) > EPS && Mathf.Sign(horizontal) == Mathf.Sign(-wallJumpDirX);
+        isWallSliding =
+            !isGrounded &&
+            !isDashing &&
+            isTouchingWall &&
+            rb.linearVelocity.y <= 0f &&
+            (!requireHoldingTowardWallToSlide || holdingTowardWall);
+
+        // Flip sprite (don’t fight wall-jump lock)
+        if (wallJumpLockLeft <= 0f)
         {
-            rb.linearVelocity = new Vector2(
-                rb.linearVelocity.x,
-                rb.linearVelocity.y * jumpCutMultiplier
-            );
+            if (horizontal > EPS) sr.flipX = false;
+            else if (horizontal < -EPS) sr.flipX = true;
         }
 
         // Dash start
         if (Keyboard.current.cKey.wasPressedThisFrame && !isDashing && dashCooldownLeft <= 0f)
-        {
             StartDash(downHeld);
-        }
 
-        // 🔥 Cancel dash if player turns around
+        // Cancel dash if player turns around
         if (isDashing && cancelDashOnTurn && Mathf.Abs(horizontal) > EPS)
         {
             if (Mathf.Sign(horizontal) != dashDirSign)
-            {
                 EndDash();
-            }
+        }
+
+        // Consume buffered jump (wall jump priority)
+        TryConsumeBufferedJump();
+
+        // Variable jump cut
+        if (Keyboard.current.zKey.wasReleasedThisFrame && rb.linearVelocity.y > 0f)
+        {
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, rb.linearVelocity.y * jumpCutMultiplier);
         }
 
         UpdateAnimationState();
@@ -140,20 +193,105 @@ public class PlayerMovement : MonoBehaviour
         if (dashCooldownLeft > 0f)
             dashCooldownLeft -= Time.fixedDeltaTime;
 
+        if (wallJumpLockLeft > 0f)
+            wallJumpLockLeft -= Time.fixedDeltaTime;
+
         if (isDashing)
         {
             DashTick();
             return;
         }
 
-        // Horizontal ramping
-        float targetX = horizontal * moveSpeed;
+        // Horizontal ramping (ignore input briefly after wall jump)
+        float inputX = (wallJumpLockLeft > 0f) ? 0f : horizontal;
+
+        float targetX = inputX * moveSpeed;
         float rate = Mathf.Abs(targetX) > EPS ? acceleration : deceleration;
 
         float newX = Mathf.MoveTowards(rb.linearVelocity.x, targetX, rate * Time.fixedDeltaTime);
         rb.linearVelocity = new Vector2(newX, rb.linearVelocity.y);
 
+        // ✅ WALL SLIDE MUST OVERRIDE GRAVITY + FALL SPEED
+        if (isWallSliding)
+        {
+            rb.gravityScale = baseGravity * wallSlideGravityMultiplier;
+
+            if (rb.linearVelocity.y < wallSlideMaxFallSpeed)
+                rb.linearVelocity = new Vector2(rb.linearVelocity.x, wallSlideMaxFallSpeed);
+
+            return; // <- IMPORTANT: don't let ApplyBetterJumpPhysics overwrite gravityScale
+        }
+
         ApplyBetterJumpPhysics();
+    }
+
+    private void ResolveWallContact()
+    {
+        isTouchingWall = false;
+        wallJumpDirX = 0f;
+
+        if (isGrounded || isDashing || wallCheck == null) return;
+
+        Collider2D[] hits = Physics2D.OverlapCircleAll(wallCheck.position, wallCheckRadius, wallLayer);
+        Collider2D best = null;
+
+        for (int i = 0; i < hits.Length; i++)
+        {
+            Collider2D h = hits[i];
+            if (h == null) continue;
+            if (h == selfCol) continue;
+            if (h.attachedRigidbody != null && h.attachedRigidbody == rb) continue;
+
+            best = h;
+            break;
+        }
+
+        if (best != null)
+        {
+            isTouchingWall = true;
+            // wall to the right -> jump left (-1), wall to the left -> jump right (+1)
+            wallJumpDirX = (best.bounds.center.x > transform.position.x) ? -1f : 1f;
+        }
+    }
+
+    private void TryConsumeBufferedJump()
+    {
+        if (jumpBufferLeft <= 0f) return;
+        if (isDashing) return;
+
+        // 1) WALL JUMP: allowed even if you used all double jumps
+        if (!isGrounded && isTouchingWall && wallJumpDirX != 0f)
+        {
+            rb.linearVelocity = new Vector2(wallJumpDirX * wallJumpHorizontalForce, wallJumpForce);
+
+            // Face in jump direction
+            sr.flipX = wallJumpDirX < 0f;
+
+            wallJumpLockLeft = wallJumpLockTime;
+
+            // ✅ Refill air jumps after wall jump (so wall jump is always useful)
+            jumpsRemaining = Mathf.Clamp(refillJumpsAfterWallJump, 0, maxJumps);
+
+            // Consume buffer and stop coyote to avoid double-trigger
+            jumpBufferLeft = 0f;
+            coyoteTimeLeft = 0f;
+
+            return;
+        }
+
+        // 2) NORMAL JUMP (ground/coyote/air)
+        bool canUseCoyote = (coyoteTimeLeft > 0f) && (jumpsRemaining == maxJumps);
+
+        if (jumpsRemaining > 0 || canUseCoyote)
+        {
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, jumpForce);
+
+            if (!canUseCoyote)
+                jumpsRemaining--;
+
+            jumpBufferLeft = 0f;
+            coyoteTimeLeft = 0f;
+        }
     }
 
     private void DashTick()
@@ -168,8 +306,7 @@ public class PlayerMovement : MonoBehaviour
 
         rb.linearVelocity = new Vector2(newX, newY);
 
-        rb.gravityScale = baseGravity *
-            (isDownDash ? downDashGravityMultiplier : dashGravityMultiplier);
+        rb.gravityScale = baseGravity * (isDownDash ? downDashGravityMultiplier : dashGravityMultiplier);
 
         if (dashTimeLeft <= 0f)
             EndDash();
@@ -263,7 +400,10 @@ public class PlayerMovement : MonoBehaviour
 
     private void OnDrawGizmosSelected()
     {
-        if (groundCheck == null) return;
-        Gizmos.DrawWireSphere(groundCheck.position, groundCheckRadius);
+        if (groundCheck != null)
+            Gizmos.DrawWireSphere(groundCheck.position, groundCheckRadius);
+
+        if (wallCheck != null)
+            Gizmos.DrawWireSphere(wallCheck.position, wallCheckRadius);
     }
 }
