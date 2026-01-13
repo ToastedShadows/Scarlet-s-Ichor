@@ -58,6 +58,10 @@ public class PlayerMovement : MonoBehaviour
     [SerializeField] private float rollExtraDecel = 20f;  // extra X decel during roll (helps it feel like a roll)
     [SerializeField] private bool cancelRollOnTurn = false;
 
+    [Header("Fast Fall")]
+    [SerializeField] private float fastFallGravityMultiplier = 1.7f; // extra gravity while holding S in air
+    [SerializeField] private float maxFastFallSpeed = -26f;          // clamp when fast-falling (more negative = faster)
+
     [Header("Jump Feel")]
     [SerializeField] private float apexVelocityThreshold = 1.5f;
     [SerializeField] private float apexGravityMultiplier = 0.5f;
@@ -145,8 +149,9 @@ public class PlayerMovement : MonoBehaviour
             isTouchingWall &&
             rb.linearVelocity.y < 0f;
 
-        // Roll start (S)
-        if (Keyboard.current.sKey.wasPressedThisFrame && !isRolling && rollCooldownLeft <= 0f)
+        // ✅ Roll start (LEFT SHIFT)
+        if ((Keyboard.current.leftShiftKey.wasPressedThisFrame || Keyboard.current.rightShiftKey.wasPressedThisFrame)
+            && !isRolling && rollCooldownLeft <= 0f)
         {
             StartRoll();
         }
@@ -199,7 +204,7 @@ public class PlayerMovement : MonoBehaviour
         float newX = Mathf.MoveTowards(rb.linearVelocity.x, targetX, rate * Time.fixedDeltaTime);
         rb.linearVelocity = new Vector2(newX, rb.linearVelocity.y);
 
-        // Wall slide override
+        // Wall slide override (fast-fall should NOT override wall slide)
         if (isWallSliding)
         {
             rb.gravityScale = baseGravity * wallSlideGravityMultiplier;
@@ -210,7 +215,8 @@ public class PlayerMovement : MonoBehaviour
             return;
         }
 
-        ApplyBetterJumpPhysics(); // ✅ gravity stays normal during roll (no glide)
+        ApplyBetterJumpPhysics();
+        ApplyFastFall(); // ✅ after normal gravity logic
     }
 
     // ===== ROLL =====
@@ -233,12 +239,36 @@ public class PlayerMovement : MonoBehaviour
         isRolling = false;
     }
 
+    // ===== FAST FALL (hold S) =====
+    private void ApplyFastFall()
+    {
+        bool holdingS = Keyboard.current.sKey.isPressed;
+        bool pressedS = Keyboard.current.sKey.wasPressedThisFrame;
+
+        if (isGrounded) return;
+
+        // ✅ INSTANT: the moment you press S in the air, force downward speed
+        if (pressedS)
+        {
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, maxFastFallSpeed);
+        }
+
+        // ✅ While holding S, keep fast-fall gravity + clamp fall speed
+        if (holdingS)
+        {
+            rb.gravityScale = baseGravity * fallGravityMultiplier * fastFallGravityMultiplier;
+
+            if (rb.linearVelocity.y < maxFastFallSpeed)
+                rb.linearVelocity = new Vector2(rb.linearVelocity.x, maxFastFallSpeed);
+        }
+    }
+
+
+
     // ===== JUMP LOGIC =====
     private void TryConsumeBufferedJump()
     {
         if (jumpBufferLeft <= 0f) return;
-
-        // (Optional) allow jumping during roll; if you want roll to block jumps, add: if (isRolling) return;
 
         // Wall jump (allowed even if you used all double jumps)
         if (!isGrounded && isTouchingWall)
