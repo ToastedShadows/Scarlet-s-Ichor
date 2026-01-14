@@ -131,15 +131,7 @@ public class PlayerMovement : MonoBehaviour
             coyoteTimeLeft -= Time.deltaTime;
         }
 
-        // Flip sprite (don’t fight wall-jump lock)
-        if (wallJumpLockLeft <= 0f)
-        {
-            if (horizontal > EPS) sr.flipX = false;
-            else if (horizontal < -EPS) sr.flipX = true;
-        }
-
-        // Wall check moves with facing
-        UpdateWallCheckPosition();
+        // Wall contact (checks both sides)
         ResolveWallContact();
 
         // Wall slide (disabled while rolling)
@@ -263,8 +255,6 @@ public class PlayerMovement : MonoBehaviour
         }
     }
 
-
-
     // ===== JUMP LOGIC =====
     private void TryConsumeBufferedJump()
     {
@@ -298,6 +288,7 @@ public class PlayerMovement : MonoBehaviour
     }
 
     // ===== WALL CHECK =====
+    // (kept as-is; no longer used)
     private void UpdateWallCheckPosition()
     {
         if (!wallCheck) return;
@@ -310,17 +301,24 @@ public class PlayerMovement : MonoBehaviour
         isTouchingWall = false;
         wallJumpDirX = 0f;
 
-        if (!wallCheck) return;
+        float x = Mathf.Abs(wallCheckOffset.x);
 
-        Collider2D[] hits = Physics2D.OverlapCircleAll(wallCheck.position, wallCheckRadius, wallLayer);
-        foreach (Collider2D h in hits)
+        Vector2 basePos = (Vector2)transform.position + new Vector2(0f, wallCheckOffset.y);
+        Vector2 rightPos = basePos + new Vector2(+x, 0f);
+        Vector2 leftPos = basePos + new Vector2(-x, 0f);
+
+        bool touchingRight = Physics2D.OverlapCircle(rightPos, wallCheckRadius, wallLayer);
+        bool touchingLeft = Physics2D.OverlapCircle(leftPos, wallCheckRadius, wallLayer);
+
+        if (touchingRight)
         {
-            if (h == null) continue;
-            if (h == selfCol) continue;
-
             isTouchingWall = true;
-            wallJumpDirX = (h.bounds.center.x > transform.position.x) ? -1f : 1f;
-            break;
+            wallJumpDirX = -1f;
+        }
+        else if (touchingLeft)
+        {
+            isTouchingWall = true;
+            wallJumpDirX = 1f;
         }
     }
 
@@ -342,6 +340,14 @@ public class PlayerMovement : MonoBehaviour
         {
             rb.gravityScale = baseGravity;
         }
+    }
+
+    public void SetFacing(bool faceLeft)
+    {
+        // Don’t fight wall-jump lock
+        if (wallJumpLockLeft > 0f) return;
+
+        sr.flipX = faceLeft;
     }
 
     private void UpdateAnimationState()

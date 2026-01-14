@@ -7433,10 +7433,11 @@ MonoBehaviour:
   firePoint: {fileID: 70886976}
   bulletPrefab: {fileID: 959127470}
   cam: {fileID: 519420031}
-  playerMovement: {fileID: 1728524115}
   bulletSpeed: 18
   fireCooldown: 0.12
-  gunOffset: {x: 0.45, y: 0.15}
+  rotateGunToCursor: 1
+  flipWhenAimingLeft: 1
+  gunVisual: {fileID: 820442948}
 --- !u!212 &820442950
 SpriteRenderer:
   serializedVersion: 2
